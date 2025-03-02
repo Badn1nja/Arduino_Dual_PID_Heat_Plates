@@ -79,20 +79,19 @@ bool RunningState = false;
 bool AutoPIDState = false;
 bool StressTest = false;
 unsigned long lastTempUpdate;
-// Function Prototypesvoid checkFault(int8_t status);
-void ExitLoopEncoder();
+// Function Prototypes
+void checkFault(int8_t status);
 void sampleUntilNonZero();
 void toggleBacklight(bool isOn);
-void LOOP_STATECTL();
-void Stopping();
-void LOOP_AUTOPID();
-void TempDisplayLoop();
+void handleMainLoop();
+void stopOperation();
+void startAutoPID();
+void displayTemperatures();
 void checkStatus();
-bool VALIDATION_SETPOINT();
-void LOOP_EXITLOOP();
+bool validateSetpoint();
+void handleExitRequest();
 bool updateTemperature();
-void autotuneAndSavePIDValues();
-void AUTOTUNE_FUNCTION(double target);
+void performAutoTune(double target, Plate& plate);
 void readPIDValuesFromEEPROM();
 
 // Function prototypes for autotuning
@@ -229,14 +228,13 @@ void setup() {
 // Loop Function
 void loop() {
   rotaryInput.observe();
-  LOOP_STATECTL();
-  if(RunningState) {
-    OverheatCheck();
+  handleMainLoop();
+  if (RunningState) {
+    checkOverheatCondition();
   }
 }
-// function for updating pid:
 
-void TempDisplayLoop() {
+void displayTemperatures() {
   lcd.setCursor(0, 0);
   lcd.print("T1: ");
   lcd.print(plate0.temperature);
@@ -253,6 +251,7 @@ void checkStatus() {
   checkFault(plate0.sensor.getStatus());
   checkFault(plate1.sensor.getStatus());
 }
+
 void checkFault(int8_t status) {
   if (status == 0) return;
   menu.hide();
@@ -276,38 +275,36 @@ void checkFault(int8_t status) {
     }
   }
 }
-void OverheatCheck() {
+
+void checkOverheatCondition() {
   plate0.UpdateTemp();
   plate1.UpdateTemp();
-  if(StressTest) {
-    if (plate0.temperature > STRESS_TARGET + 10 || plate1.temperature > STRESS_TARGET + 10) {
-      menu.hide();
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print(F("OVERHEAT!"));
-      lcd.setCursor(0, 1);
-      lcd.print(F("STOPPING PLATES"));
-      delay(2000);
-      lcd.clear();
-      menu.show();
-      Stopping();
-    }
-  if(RunningState) {
-    if(plate0.temperature > TargetSetpoint + 15 || plate1.temperature > TargetSetpoint + 15) {
-      menu.hide();
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print(F("OVERHEAT!"));
-      lcd.setCursor(0, 1);
-      lcd.print(F("STOPPING PLATES"));
-      delay(2000);
-      lcd.clear();
-      menu.show();
-      Stopping();
+  
+  bool isOverheated = false;
+  
+  if (StressTest) {
+    isOverheated = (plate0.temperature > STRESS_TARGET + 10 || 
+                    plate1.temperature > STRESS_TARGET + 10);
+  } else if (RunningState) {
+    isOverheated = (plate0.temperature > TargetSetpoint + 15 || 
+                    plate1.temperature > TargetSetpoint + 15);
   }
-  };
+  
+  if (isOverheated) {
+    menu.hide();
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(F("OVERHEAT!"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("STOPPING PLATES"));
+    delay(2000);
+    lcd.clear();
+    menu.show();
+    stopOperation();
+  }
+}
 
-bool VALIDATION_SETPOINT() {
+bool validateSetpoint() {
   if (TargetSetpoint != 0) return true;
   menu.hide();
   lcd.setCursor(0, 0);
@@ -320,10 +317,9 @@ bool VALIDATION_SETPOINT() {
   return false;
 }
 
-
-void LOOP_EXITLOOP() {
+void handleExitRequest() {
   if (encoder.push() == 1) {
-    Stopping();
+    stopOperation();
   }
 }
 
@@ -331,8 +327,8 @@ void toggleBacklight(bool isOn) {
   lcdAdapter.setBacklight(isOn);
 }
 
-void LOOP_AUTOPID() {
-  if (VALIDATION_SETPOINT()) {
+void startAutoPID() {
+  if (validateSetpoint()) {
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print(F("PID starting..."));
@@ -344,6 +340,7 @@ void LOOP_AUTOPID() {
     lcd.clear();
   }
 }
+
 void applyPIDValues(int plate, double setpoint) {
   if (plate < 0 || plate >= PLATE_COUNT) return;
   if (setpoint < MIN_TEMP || setpoint > MAX_TEMP) return;
@@ -359,7 +356,8 @@ void applyPIDValues(int plate, double setpoint) {
     autopid1.setGains(kp, ki, kd);
   }
 }
-void Stopping() {
+
+void stopOperation() {
   RunningState = false;
   lcd.clear();
   lcd.setCursor(0, 0);
@@ -376,30 +374,22 @@ void Stopping() {
   }
 }
 
-double OUTPUT_PWM0() {
+double getOutputPWM(Plate& plate) {
   if (InvertedOutput) {
-    return OUTPUT_MAX - plate0.output;
+    return OUTPUT_MAX - plate.output;
   } else {
-    return plate0.output;
+    return plate.output;
   }
 }
 
-double OUTPUT_PWM1() {
-  if (InvertedOutput) {
-    return OUTPUT_MAX - plate1.output;
-  } else {
-    return plate1.output;
-  }
-}
-
-void LOOP_STATECTL() {
+void handleMainLoop() {
   if (RunningState) {
     updateTemperature();
     if (AutoPIDState) {
       autopid0.run();
       autopid1.run();
-      analogWrite(plate0.heaterPin, OUTPUT_PWM0());
-      analogWrite(plate1.heaterPin, OUTPUT_PWM1());
+      analogWrite(plate0.heaterPin, getOutputPWM(plate0));
+      analogWrite(plate1.heaterPin, getOutputPWM(plate1));
     }
   }
 }
@@ -412,22 +402,25 @@ bool updateTemperature() {
   }
   return false;
 }
-void autotuneRange(int plate) {
+void autotuneRange(int plateNum) {
+  Plate& plate = (plateNum == 0) ? plate0 : plate1;
   for (int temp = MIN_TEMP; temp <= TEMP_RANGE_MAX; temp += TEMP_STEP) {
-    AUTOTUNE_FUNCTION(temp);
-    updatePIDArray(plate, temp, tuner.getKp(), tuner.getKi(), tuner.getKd());
-    savePIDToEEPROM(plate, temp);
+    performAutoTune(temp, plate);
+    updatePIDArray(plateNum, temp, tuner.getKp(), tuner.getKi(), tuner.getKd());
+    savePIDToEEPROM(plateNum, temp);
   }
 }
-void autotuneSingleValue(int plate, int temp) {
+
+void autotuneSingleValue(int plateNum, int temp) {
   if (temp < MIN_TEMP || temp > TEMP_RANGE_MAX) {
     Serial.println("Temperature out of range");
     return;
   }
 
-  AUTOTUNE_FUNCTION(temp);
-  updatePIDArray(plate, temp, tuner.getKp(), tuner.getKi(), tuner.getKd());
-  savePIDToEEPROM(plate, temp);
+  Plate& plate = (plateNum == 0) ? plate0 : plate1;
+  performAutoTune(temp, plate);
+  updatePIDArray(plateNum, temp, tuner.getKp(), tuner.getKi(), tuner.getKd());
+  savePIDToEEPROM(plateNum, temp);
 }
 void savePIDToEEPROM(int plate, int temp) {
   if (plate < 0 || plate >= PLATE_COUNT) return;
