@@ -206,8 +206,9 @@ void setup() {
   plate1.sensor.begin(plate1.csPin, RTD_3_WIRE, RTD_TYPE_PT100);
   // Ensures sensors are ready before starting
   do {
-    int i;
-    i++;
+-    int i;
++    int i = 0;
+     i++;
     if(i > 40) {checkStatus();}
     plate0.sensor.sample();
     plate0.UpdateTemp();
