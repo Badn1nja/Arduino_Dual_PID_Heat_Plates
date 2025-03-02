@@ -95,12 +95,46 @@ void autotuneAndSavePIDValues();
 void AUTOTUNE_FUNCTION(double target);
 void readPIDValuesFromEEPROM();
 
+// Function prototypes for autotuning
+void startFullRangeAutotune();
+void startSinglePlateAutotune(int plate);
+bool confirmAutotune();
+void showTuningProgress(int currentTemp, int totalSteps, int plate);
+void cancelAutotuning();
+
+volatile bool autotuneCancelled = false;
+volatile bool autotuningInProgress = false;
+
 // Menu
 extern MenuScreen* tuningMenu;
 const char* options[] = {"Yes", "No"};
+
+MENU_SCREEN(AutotuneMenu, AutotuneItems,
+  ITEM_COMMAND("Tune Both Plates", []() {
+    if (confirmAutotune()) {
+      menu.hide();
+      startFullRangeAutotune();
+    }
+  }),
+  ITEM_COMMAND("Tune Plate 1", []() {
+    if (confirmAutotune()) {
+      menu.hide();
+      startSinglePlateAutotune(0);
+    }
+  }),
+  ITEM_COMMAND("Tune Plate 2", []() {
+    if (confirmAutotune()) {
+      menu.hide();
+      startSinglePlateAutotune(1);
+    }
+  }),
+  ITEM_BACK("Back")
+);
+
 MENU_SCREEN(MainScreen, MainItems,
   ITEM_WIDGET("Temp", [](int settemp) { TargetSetpoint = settemp; }, WIDGET_RANGE(80, 5, 60, 130, "%dC", 1)),
-  ITEM_COMMAND("Start AutoPID", LOOP_AUTOPID)
+  ITEM_COMMAND("Start AutoPID", LOOP_AUTOPID),
+  ITEM_SUBMENU("Autotune PIDs", AutotuneMenu)
 );
 
 // Plate Struct
@@ -197,7 +231,8 @@ void loop() {
   rotaryInput.observe();
   LOOP_STATECTL();
   if(RunningState) {
-  OverheatCheck();
+    OverheatCheck();
+  }
 }
 // function for updating pid:
 
@@ -454,44 +489,236 @@ void updatePIDArray(int plate, int temp, float kp, float ki, float kd) {
   kiValues[plate][index] = ki;
   kdValues[plate][index] = kd;
 }
-void AUTOTUNE_FUNCTION(double target) {
+bool confirmAutotune() {
+  menu.hide();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F("Warning: Takes"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("~30min. Start?"));
+  delay(2000);
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F("Rot:Yes Btn:No"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("Continue?"));
+  
+  while (true) {
+    byte rotation = encoder.rotate();
+    if (rotation == 1) {  // Clockwise
+      return true;
+    }
+    if (encoder.push() == 1) {  // Button press
+      menu.show();
+      return false;
+    }
+  }
+}
+
+void showTuningProgress(int currentTemp, int totalSteps, int plate) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F("Tuning P"));
+  lcd.print(plate + 1);
+  lcd.print(F(" "));
+  lcd.print(currentTemp);
+  lcd.print(F("C"));
+  
+  lcd.setCursor(0, 1);
+  int progress = ((currentTemp - MIN_TEMP) * 16) / (TEMP_RANGE_MAX - MIN_TEMP);
+  for (int i = 0; i < 16; i++) {
+    lcd.print(i < progress ? (char)255 : '-');
+  }
+}
+
+void checkSafetyConditions(Plate& plate) {
+  if (plate.temperature > MAX_TEMP) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(F("SAFETY STOP!"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("Temp too high!"));
+    delay(2000);
+    throw "Temperature exceeded safety limit";
+  }
+}
+
+void waitForStableTemp(Plate& plate, double targetTemp, int timeoutSecs = 300) {
+  unsigned long startTime = millis();
+  double tempSum = 0;
+  int readings = 0;
+  const int requiredReadings = 10;
+  const double tolerance = 0.5;
+
+  while (readings < requiredReadings) {
+    if (encoder.push() == 1) {  // Check for button press to cancel
+      autotuneCancelled = true;
+      return;
+    }
+
+    if ((millis() - startTime) > (timeoutSecs * 1000UL)) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print(F("Timeout waiting"));
+      lcd.setCursor(0, 1);
+      lcd.print(F("for stable temp"));
+      delay(2000);
+      throw "Timeout waiting for temperature stabilization";
+    }
+
+    double currentTemp = plate.UpdateTemp();
+    checkSafetyConditions(plate);
+
+    if (abs(currentTemp - targetTemp) < tolerance) {
+      tempSum += currentTemp;
+      readings++;
+    } else {
+      tempSum = 0;
+      readings = 0;
+    }
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(F("Stabilizing:"));
+    lcd.setCursor(0, 1);
+    lcd.print(currentTemp, 1);
+    lcd.print(F("C "));
+    lcd.print(readings);
+    lcd.print(F("/"));
+    lcd.print(requiredReadings);
+    
+    delay(1000);
+  }
+}
+
+void AUTOTUNE_FUNCTION(double target, Plate& plate) {
   // Set the target value to tune to
   tuner.setTargetInputValue(target);
-  // Set the loop interval in microseconds
   tuner.setLoopInterval(PID_CALC_DELAY);
-
-  // Set the output range
   tuner.setOutputRange(OUTPUT_MIN, OUTPUT_MAX);
-
-  // Set the Ziegler-Nichols tuning mode
   tuner.setZNMode(PIDAutotuner::znModeNoOvershoot);
 
-  // This must be called immediately before the tuning loop
+  // Wait for temperature to stabilize before starting
+  try {
+    waitForStableTemp(plate, target);
+  } catch (const char* msg) {
+    throw msg;  // Re-throw to be caught by caller
+  }
+
+  if (autotuneCancelled) return;
+
+  // Start the tuning loop
   tuner.startTuningLoop();
-
-  // Run a loop until tuner.isFinished() returns true
-  while (!tuner.isFinished()) {
-    // This loop must run at the same speed as the PID control loop being tuned
+  unsigned long lastUpdate = 0;
+  
+  while (!tuner.isFinished() && !autotuneCancelled) {
     long microseconds = micros();
+    
+    checkSafetyConditions(plate);
+    
+    // Update display every second
+    if (millis() - lastUpdate > 1000) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print(F("Tuning: "));
+      lcd.print(target);
+      lcd.print(F("C"));
+      lcd.setCursor(0, 1);
+      lcd.print(F("Temp: "));
+      lcd.print(plate.temperature, 1);
+      lastUpdate = millis();
+    }
 
-    // Get input value here (temperature)
-    double input = plate0.UpdateTemp();
+    // Check for cancel button press
+    if (encoder.push() == 1) {
+      autotuneCancelled = true;
+      break;
+    }
 
-    // Call tunePID() with the input value and current time in microseconds
-    plate0.output = tuner.tunePID(plate0.UpdateTemp());
+    plate.output = tuner.tunePID(plate.UpdateTemp());
+    analogWrite(plate.heaterPin, InvertedOutput ? (OUTPUT_MAX - plate.output) : plate.output);
 
-    // Set the output - tunePID() will return values within the range configured
-    analogWrite(HeaterPin0, OUTPUT_PWM0());
-
-    // This loop must run at the same speed as the PID control loop being tuned
     while (micros() - microseconds < PID_CALC_DELAY) delayMicroseconds(1);
   }
 
-  // Turn the output off here
-  analogWrite(HeaterPin0, HIGH);
+  // Turn off heater
+  analogWrite(plate.heaterPin, InvertedOutput ? OUTPUT_MAX : OUTPUT_MIN);
 
-  // Get PID gains - set your PID controller's gains to these
-  plate0.kp = tuner.getKp();
-  plate0.ki = tuner.getKi();
-  plate0.kd = tuner.getKd();
+  if (!autotuneCancelled) {
+    // Get and store PID gains
+    plate.kp = tuner.getKp();
+    plate.ki = tuner.getKi();
+    plate.kd = tuner.getKd();
+  }
+}
+
+void startSinglePlateAutotune(int plateNum) {
+  Plate& plate = (plateNum == 0) ? plate0 : plate1;
+  autotuningInProgress = true;
+  autotuneCancelled = false;
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F("Starting tune"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("for plate "));
+  lcd.print(plateNum + 1);
+  delay(2000);
+
+  try {
+    int totalSteps = (TEMP_RANGE_MAX - MIN_TEMP) / TEMP_STEP + 1;
+    for (int temp = MIN_TEMP; temp <= TEMP_RANGE_MAX && !autotuneCancelled; temp += TEMP_STEP) {
+      showTuningProgress(temp, totalSteps, plateNum);
+      AUTOTUNE_FUNCTION(temp, plate);
+      
+      if (!autotuneCancelled) {
+        updatePIDArray(plateNum, temp, tuner.getKp(), tuner.getKi(), tuner.getKd());
+        savePIDToEEPROM(plateNum, temp);
+      }
+    }
+  } catch (const char* msg) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(F("Error: "));
+    lcd.setCursor(0, 1);
+    lcd.print(msg);
+    delay(3000);
+  }
+
+  // Cleanup
+  analogWrite(plate.heaterPin, InvertedOutput ? OUTPUT_MAX : OUTPUT_MIN);
+  autotuningInProgress = false;
+  
+  if (autotuneCancelled) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(F("Tuning"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("Cancelled"));
+    delay(2000);
+  } else {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(F("Tuning"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("Complete!"));
+    delay(2000);
+  }
+  
+  menu.show();
+}
+
+void startFullRangeAutotune() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F("Full range tune"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("Both plates"));
+  delay(2000);
+  
+  startSinglePlateAutotune(0);  // Tune plate 1
+  if (!autotuneCancelled) {
+    startSinglePlateAutotune(1);  // Tune plate 2
+  }
 }
